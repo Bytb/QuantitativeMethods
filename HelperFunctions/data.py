@@ -116,8 +116,8 @@ def get_SP500(period='1y', max_workers=32, *, start=None, end=None, interval='1D
     return pd.concat(prices, axis=1)
 
 
-def get_stock_returns(ticker, start, end=None, interval='1D'):
-    """Return a one-column DataFrame of fractional adjusted returns per bar.
+def get_stock_returns(ticker, start, end=None, interval='1D', max_workers=None):
+    """Return fractional adjusted returns per bar for a ticker or ticker list.
 
     Start/end accept yfinance dates ('YYYY-MM-DD' or datetime objects).
     Start is inclusive; end is exclusive and defaults to now. The column
@@ -126,7 +126,16 @@ def get_stock_returns(ticker, start, end=None, interval='1D'):
     Missing prices are not forward-filled. interval accepts '1H', '1D',
     or other yfinance interval strings, ignoring case. Returns follow the
     selected interval. Intraday timestamps retain their time in UTC.
+    A list of tickers is downloaded concurrently using worker threads.
     """
+    if not isinstance(ticker, str):
+        tickers = list(ticker)
+        if not tickers:
+            raise ValueError('At least one ticker is required')
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            frames = list(executor.map(
+                lambda symbol: get_stock_returns(symbol, start, end, interval), tickers))
+        return pd.concat(frames, axis=1)
     if not isinstance(ticker, str) or not ticker.strip():
         raise ValueError('ticker must be a nonempty string')
     if start is None:
@@ -134,6 +143,44 @@ def get_stock_returns(ticker, start, end=None, interval='1D'):
     ticker = ticker.strip().upper().replace('.', '-')
     close = _fetch_close(ticker, start=start, end=end, interval=interval)
     return close.pct_change(fill_method=None).iloc[1:].to_frame(name=ticker)
+
+
+def get_stock_volume(ticker, start=None, end=None, interval='1D', period='1y', max_workers=None):
+    """Return traded share volume per bar for a ticker or ticker list.
+
+    Supports yfinance start/end dates and intervals such as '1H' or '1D'.
+    Explicit dates override period; end is exclusive. Use period='max'
+    for the longest available history at the selected interval. Intraday
+    timestamps are retained in UTC; daily dates are timezone-naive.
+    Zero-volume bars are retained rather than treated as missing values.
+    A list of tickers is downloaded concurrently using worker threads.
+    """
+    if not isinstance(ticker, str):
+        tickers = list(ticker)
+        if not tickers:
+            raise ValueError('At least one ticker is required')
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            frames = list(executor.map(
+                lambda symbol: get_stock_volume(symbol, start, end, interval, period), tickers))
+        return pd.concat(frames, axis=1)
+    if not isinstance(ticker, str) or not ticker.strip():
+        raise ValueError('ticker must be a nonempty string')
+    ticker = ticker.strip().upper().replace('.', '-')
+    interval = _normalize_interval(interval)
+    if start is not None or end is not None:
+        history = yf.Ticker(ticker).history(
+            start=start, end=end, interval=interval, auto_adjust=True)
+    else:
+        history = yf.Ticker(ticker).history(
+            period=period, interval=interval, auto_adjust=True)
+    if history.empty or 'Volume' not in history:
+        raise ValueError(f'No volume history returned for {ticker}')
+    volume = history['Volume'].copy()
+    if interval in {'1d', '5d', '1wk', '1mo', '3mo'}:
+        volume.index = volume.index.tz_localize(None).normalize()
+    elif volume.index.tz is not None:
+        volume.index = volume.index.tz_convert('UTC')
+    return volume.sort_index().to_frame(name=ticker)
 
 
 def _fetch_market_cap(ticker):

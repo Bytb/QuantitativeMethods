@@ -1,10 +1,11 @@
 """Technical signals calculated from DataFrames of closing prices."""
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from numbers import Integral
 import os
 
 import numpy as np
 import pandas as pd
+from scipy.signal import lfilter
 
 
 def _rsi_column(task):
@@ -17,12 +18,14 @@ def _rsi_column(task):
     losses = np.maximum(-changes, 0)
     gain = gains[:periods].mean()
     loss = losses[:periods].mean()
-    for i in range(periods, len(values)):
-        if i > periods:
-            gain = ((periods - 1) * gain + gains[i - 1]) / periods
-            loss = ((periods - 1) * loss + losses[i - 1]) / periods
-        result[i] = (50.0 if gain == 0 else 100.0) if loss == 0 else (
-            100.0 - 100.0 / (1.0 + gain / loss))
+    alpha = 1.0 / periods
+    beta = 1.0 - alpha
+    # Compiled recursive filters preserve Wilder's initial simple-average seed.
+    smooth_gain = np.r_[gain, lfilter([alpha], [1, -beta], gains[periods:], zi=[beta * gain])[0]]
+    smooth_loss = np.r_[loss, lfilter([alpha], [1, -beta], losses[periods:], zi=[beta * loss])[0]]
+    total = smooth_gain + smooth_loss
+    result[periods:] = np.divide(100 * smooth_gain, total,
+                                out=np.full_like(total, 50.0), where=total != 0)
     return result
 
 
@@ -82,10 +85,10 @@ def wilder_rsi(prices, periods=14, plot=False, max_workers=None):
     rows remain NaN. Flat prices give RSI 50; gains only give 100, losses
     only give 0. Input prices must be finite and in chronological order.
 
-    Multiple columns use worker processes; one column runs locally.
+    Multiple columns use worker threads; one column runs locally.
     plot=True draws one chart per ticker, without legends, using red above
-    70, blue below 30, and gray between thresholds. In standalone scripts,
-    call this under `if __name__ == '__main__':` for Windows multiprocessing.
+    70, blue below 30, and gray between thresholds. Plotting runs on the
+    calling thread after all calculations finish.
     """
     if isinstance(prices, pd.Series):
         prices = prices.to_frame(name=prices.name or 'Price')
@@ -106,7 +109,7 @@ def wilder_rsi(prices, periods=14, plot=False, max_workers=None):
     tasks = [(values[:, i], periods) for i in range(values.shape[1])]
     if len(tasks) > 1:
         workers = min(len(tasks), max_workers or (os.cpu_count() or 1), 61)
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             columns = list(executor.map(_rsi_column, tasks))
     else:
         columns = [_rsi_column(tasks[0])]
@@ -115,3 +118,46 @@ def wilder_rsi(prices, periods=14, plot=False, max_workers=None):
     if plot:
         _plot_rsi(result, periods)
     return result
+
+def plot_cumulative_returns(events, max_workers=None):
+    """Plot compounded completed-trade wealth per ticker, starting at 1.
+
+    Returns a wide DataFrame indexed by exit timestamps. Trades exiting at
+    the same timestamp are combined multiplicatively; pre-first-exit values
+    are one. Incomplete/excluded trades are omitted. This event-return
+    summary is not a capital-weighted portfolio equity curve: overlapping
+    trades have no capital allocation specified. No legend is displayed.
+    """
+    import matplotlib.pyplot as plt
+    from .labeling import get_labels
+    from .parallel import parallel_map
+    labels = get_labels(events, max_workers=max_workers)
+    if labels.empty:
+        raise ValueError('No completed events are available to plot')
+    if not np.isfinite(labels['ret']).all() or (labels['ret'] < -1).any():
+        raise ValueError('Compounding requires finite trade returns of at least -100%')
+    def calculate(group):
+        gross = (1 + group.set_index('t1')['ret']).groupby(level=0).prod().sort_index()
+        curve = gross.cumprod()
+        curve.name = group['ticker'].iloc[0]
+        return curve
+    groups = [group for _, group in labels.groupby('ticker', sort=False)]
+    curves = pd.concat(parallel_map(calculate, groups, max_workers), axis=1).sort_index()
+    curves = curves.ffill().fillna(1.0)
+    # Anchor at one before the first realized exit.
+    start = labels['entry_time'].min()
+    curves.loc[start] = 1.0
+    curves = curves.sort_index()
+    curves.index.name = 'exit_time'
+    for ticker in curves.columns:
+        plt.figure(figsize=(14, 5))
+        ax = curves[ticker].plot(
+            figsize=(14, 5), legend=False, drawstyle='steps-post',
+            title=f'{ticker} — Compounded Event Returns (Start = 1)')
+        ax.axhline(1, color='gray', linewidth=0.8)
+        ax.set_xlabel('Exit date / time')
+        ax.set_ylabel('Cumulative value (initial value = 1)')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+    plt.show()
+    return curves
