@@ -8,6 +8,148 @@ import pandas as pd
 from scipy.signal import lfilter
 
 
+def plot_event_barriers(events, prices, *, allow_short=True, seed=42):
+    """Plot four random completed events in a 2x2 grid, without replacement.
+
+    Select two longs/two shorts if allow_short, otherwise four longs.
+    Show observed closes before entry and beyond the vertical barrier, with
+    entry approximately 40% across the time window, plus price barriers,
+    and actual closing-price exit. Return (figure, axes, selected_event_ids).
+    If an early exit has no observed vertical bar, show the calendar deadline
+    and mark that future price coverage is unavailable. Insufficient events
+    raise ValueError. prices may be a Series or ticker-column DataFrame.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+
+    required = {'ticker', 'side', 'status', 'entry_time', 'entry_price',
+                'pt_price', 'sl_price', 'vertical_time', 'deadline',
+                't1', 'exit_price', 'exit_type'}
+    if not isinstance(events, pd.DataFrame) or not required.issubset(events):
+        raise ValueError('events must be create_events output')
+    if not events.index.is_unique:
+        raise ValueError('Event IDs must be unique')
+    if not isinstance(allow_short, (bool, np.bool_)):
+        raise ValueError('allow_short must be boolean')
+    if isinstance(prices, pd.Series):
+        tickers = events['ticker'].unique()
+        if len(tickers) != 1:
+            raise ValueError('A price Series requires single-ticker events')
+        prices = prices.to_frame(name=tickers[0])
+    if (not isinstance(prices, pd.DataFrame)
+            or not isinstance(prices.index, pd.DatetimeIndex)
+            or prices.index.hasnans or not prices.index.is_unique
+            or not prices.index.is_monotonic_increasing
+            or not prices.columns.is_unique):
+        raise ValueError('prices must have unique columns and increasing candle timestamps')
+    complete = events.loc[events['status'].eq('complete')]
+    rng = np.random.default_rng(seed)
+    selected = []
+    for side, count in ([(1, 2), (-1, 2)] if allow_short else [(1, 4)]):
+        candidates = complete.loc[complete['side'].eq(side)]
+        if len(candidates) < count:
+            direction = 'long' if side == 1 else 'short'
+            raise ValueError(f'Need {count} completed {direction} events; found {len(candidates)}')
+        positions = rng.choice(len(candidates), size=count, replace=False)
+        selected.extend(candidates.index.take(positions).tolist())
+    paths = []
+    for event_id in selected:
+        event = events.loc[event_id]
+        if event['ticker'] not in prices:
+            raise ValueError(f"Missing prices for {event['ticker']}")
+        if not np.isfinite(event[['entry_price', 'pt_price', 'sl_price', 'exit_price']].to_numpy(dtype=float)).all():
+            raise ValueError(f'Event {event_id} has invalid price fields')
+        if pd.isna(event['entry_time']) or pd.isna(event['t1']):
+            raise ValueError(f'Event {event_id} has missing entry/exit timestamps')
+        if not pd.DatetimeIndex([event['entry_time'], event['t1']]).isin(prices.index).all():
+            raise ValueError(f'Event {event_id} entry/exit candle missing from prices')
+        barrier = event['vertical_time'] if pd.notna(event['vertical_time']) else event['deadline']
+        if pd.isna(barrier):
+            raise ValueError(f'Event {event_id} has no time barrier')
+        entry = event['entry_time']
+        entry_position = prices.index.get_loc(entry)
+        barrier_position = prices.index.searchsorted(barrier, side='right') - 1
+        # At least ten observed candles after the barrier, or a quarter of
+        # its calendar horizon, whichever extends farther (when available).
+        horizon = max(barrier - entry, pd.Timedelta(hours=1))
+        after_position = min(len(prices) - 1, barrier_position + 10)
+        right = max(barrier + horizon / 4, prices.index[after_position])
+        right_span = right - entry
+        # A 2:3 left/right span puts entry 40% across the calendar-time axis.
+        # Expand both sides if needed to include ten preceding candles.
+        before_position = max(0, entry_position - 10)
+        left_span = max(right_span * (2 / 3), entry - prices.index[before_position])
+        right_span = max(right_span, left_span * 1.5)
+        left, right = entry - left_span, entry + right_span
+        path = prices.loc[left:right, event['ticker']]
+        if path.empty or not np.isfinite(path.to_numpy(dtype=float)).all():
+            raise ValueError(f'Event {event_id} has missing/nonfinite closing prices')
+        paths.append((event, path, barrier, left, right))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10), squeeze=False)
+    for ax, event_id, (event, path, barrier, left, right) in zip(axes.flat, selected, paths):
+        ax.plot(path.index, path, color='steelblue', linewidth=1.3, label='Candle close')
+        lower, upper = sorted([event['pt_price'], event['sl_price']])
+        ax.hlines(event['pt_price'], event['entry_time'], barrier,
+                  color='seagreen', linestyle='--', linewidth=1.1, alpha=.8,
+                  label='Profit-taking barrier')
+        ax.hlines(event['sl_price'], event['entry_time'], barrier,
+                  color='firebrick', linestyle='--', linewidth=1.1, alpha=.8,
+                  label='Stop-loss barrier')
+        ax.hlines(event['entry_price'], event['entry_time'], barrier,
+                  color='gray', linestyle='--', linewidth=1.0, alpha=.65,
+                  label='Entry price')
+        ax.vlines(event['entry_time'], lower, upper, color='gray',
+                  linestyle='--', linewidth=1.0, alpha=.65)
+        time_label = ('Time barrier' if pd.notna(event['vertical_time'])
+                      else 'Deadline (future candles unavailable)')
+        ax.vlines(barrier, lower, upper, color='darkorange', linestyle=':',
+                  linewidth=1.1, alpha=.8, label=time_label)
+        is_long = event['side'] == 1
+        entry_color = 'seagreen' if is_long else 'red'
+        # Circles mark the actual entry/exit close. Exits reverse the
+        # entry transaction: sell a long, buy back a short.
+        for timestamp, price, color in [
+            (event['entry_time'], event['entry_price'], entry_color),
+            (event['t1'], event['exit_price'],
+             'red' if is_long else 'seagreen'),
+        ]:
+            ax.scatter([timestamp], [price], marker='o', s=90,
+                       facecolors='none', edgecolors=color, linewidths=1.6,
+                       zorder=6)
+        ax.text(event['t1'], event['exit_price'],
+                f"  Exit: {event['exit_type']}", fontsize=8, va='center')
+        ax.set_xlim(left, right)
+        if left < prices.index[0] or right > prices.index[-1]:
+            ax.text(.02, .98, 'Context limited by available price history',
+                    transform=ax.transAxes, va='top', fontsize=8, color='dimgray')
+        direction = 'Long' if event['side'] == 1 else 'Short'
+        ax.set(title=f"{event['ticker']} — {direction} event {event_id}",
+               xlabel='Candle timestamp', ylabel='Price ($)')
+        locator = mdates.AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=prices.index.tz))
+        ax.grid(alpha=.2)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    # Include exit reasons that may differ between panels.
+    legend_items = dict(zip(labels, handles))
+    for ax in axes.flat:
+        handles, labels = ax.get_legend_handles_labels()
+        legend_items.update(zip(labels, handles))
+    from matplotlib.lines import Line2D
+    legend_items['Buy / long entry / short exit'] = Line2D(
+        [], [], color='seagreen', marker='o', markerfacecolor='none',
+        markeredgewidth=1.6, markersize=9, linestyle='None')
+    legend_items['Sell / short entry / long exit'] = Line2D(
+        [], [], color='red', marker='o', markerfacecolor='none',
+        markeredgewidth=1.6, markersize=9, linestyle='None')
+    fig.legend(legend_items.values(), legend_items.keys(), loc='lower center',
+               ncol=4, fontsize=9, frameon=False)
+    fig.suptitle('Random completed events — close-only triple barriers', fontsize=15)
+    fig.tight_layout(rect=(0, .08, 1, .96))
+    plt.show()
+    return fig, axes, selected
+
+
 def _rsi_column(task):
     values, periods = task
     result = np.full(len(values), np.nan)
