@@ -1,5 +1,133 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
+from scipy import stats
+from inspect import signature
+
+
+def return_normality(data, input_type="prices", plot_qq=True,
+                     plot_distribution=True, significance_level=5.0, bins=50):
+    """Test each ticker's returns for normality and optionally plot diagnostics.
+
+    data : pandas.DataFrame
+        Numeric columns, one per ticker, in chronological row order.
+    input_type : {"prices", "pct_change"}
+        Prices are converted with pct_change(fill_method=None) * 100.
+        Supplied percent changes are used as-is (percentage points, e.g. 1 = 1%).
+    plot_qq, plot_distribution : bool
+        Independently enable the Q–Q plot and histogram for each ticker.
+    significance_level : float
+        AD rejection threshold in percent: 15, 10, 5, 2.5, or 1.
+
+    Returns a DataFrame indexed by ticker with sample counts, AD statistics,
+    critical values (older SciPy) or p-values (newer SciPy), rejection decisions,
+    and status. Missing/nonfinite returns
+    are excluded independently per ticker. Insufficient or constant samples
+    have no test decision. The null is normality with fitted mean and variance;
+    failure to reject does not establish normality. AD assumes independent
+    observations. Q–Q bounds are approximate pointwise 95% visual guides.
+    """
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        raise ValueError("data must be a nonempty pandas DataFrame.")
+    if not data.columns.is_unique:
+        raise ValueError("Ticker column names must be unique.")
+    if input_type not in ("prices", "pct_change"):
+        raise ValueError("input_type must be 'prices' or 'pct_change'.")
+    if significance_level not in (15, 10, 5, 2.5, 1):
+        raise ValueError("significance_level must be 15, 10, 5, 2.5, or 1 percent.")
+    if any(not pd.api.types.is_numeric_dtype(dtype) for dtype in data.dtypes):
+        raise TypeError("All ticker columns must be numeric.")
+    values = data.astype(float)
+    if input_type == "prices":
+        if not data.index.is_monotonic_increasing:
+            raise ValueError("Price rows must be in chronological order.")
+        if (values <= 0).any().any() or np.isinf(values.to_numpy()).any():
+            raise ValueError("Prices must be positive and finite, or missing.")
+        values = values.pct_change(fill_method=None) * 100
+
+    rows = []
+    for ticker in values.columns:
+        sample = values[ticker].to_numpy()
+        sample = sample[np.isfinite(sample)]
+        n = len(sample)
+        row = dict(ticker=ticker, n_obs=n, statistic=np.nan,
+                   significance_level=significance_level, critical_value=np.nan,
+                   p_value=np.nan,
+                   reject_normality=pd.NA, status="insufficient data")
+        if n < 3:
+            rows.append(row)
+            continue
+        std = sample.std(ddof=1)
+        if std == 0:
+            row["status"] = "constant returns"
+            rows.append(row)
+            continue
+        if "method" in signature(stats.anderson).parameters:
+            result = stats.anderson(sample, dist="norm", method="interpolate")
+            row.update(p_value=float(result.pvalue),
+                       reject_normality=bool(result.pvalue < significance_level / 100))
+        else:
+            result = stats.anderson(sample, dist="norm")
+            level_index = np.flatnonzero(
+                np.isclose(result.significance_level, significance_level)
+            )[0]
+            critical = float(result.critical_values[level_index])
+            row.update(critical_value=critical,
+                       reject_normality=bool(result.statistic > critical))
+        row.update(statistic=float(result.statistic), status="ok")
+        rows.append(row)
+
+        if plot_distribution:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.hist(sample, bins=bins, density=True, edgecolor="white",
+                    color="#65aaa8", alpha=0.7, label="Observed returns")
+            mean = sample.mean()
+            fitted_std = sample.std(ddof=0)
+            x = np.linspace(min(sample.min(), mean - 4 * fitted_std),
+                            max(sample.max(), mean + 4 * fitted_std), 500)
+            ax.plot(x, stats.norm.pdf(x, loc=mean, scale=fitted_std),
+                    color="#b87873", linewidth=2, label="Fitted normal distribution")
+            ax.set(title=f"{ticker} — Distribution of Percent Changes",
+                   xlabel="Percent change (%)", ylabel="Probability density")
+            ax.legend(frameon=False)
+            ax.grid(True, axis="y", alpha=0.3)
+            fig.tight_layout()
+            plt.show()
+        if plot_qq:
+            observed = np.sort((sample - sample.mean()) / std)
+            order = np.arange(1, n + 1)
+            theoretical = stats.norm.ppf((order - 0.5) / n)
+            slope, intercept = np.polyfit(theoretical, observed, 1)
+            lower = intercept + slope * stats.norm.ppf(
+                stats.beta.ppf(0.025, order, n + 1 - order))
+            upper = intercept + slope * stats.norm.ppf(
+                stats.beta.ppf(0.975, order, n + 1 - order))
+            fig, ax = plt.subplots(figsize=(9, 6))
+            ax.scatter(theoretical, observed, marker="+", color="#65aaa8",
+                       s=28, linewidths=0.9, label="Standardized returns")
+            ax.plot(theoretical, intercept + slope * theoretical,
+                    color="#b87873", linewidth=1.3, label="Fitted reference line")
+            ax.plot(theoretical, lower, color="#b87873", linewidth=1.3,
+                    label="Approximate 95% pointwise bounds")
+            ax.plot(theoretical, upper, color="#b87873", linewidth=1.3)
+            ax.axhline(0, color="#aaaaaa", linewidth=1.3)
+            ax.axvline(0, color="#aaaaaa", linewidth=1.3)
+            decision = "Reject normality" if row["reject_normality"] else "Do not reject normality"
+            ax.set(title=f"{ticker} — Quantile–Quantile Plot\n"
+                         f"AD = {result.statistic:.3f}; {decision} at {significance_level:g}%",
+                   xlabel="Theoretical Quantiles",
+                   ylabel="Sample Quantiles (standardized returns)")
+            ax.grid(True, color="#eeeeee", alpha=0.6)
+            ax.set_axisbelow(True)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.tick_params(length=0)
+            ax.legend(frameon=False, fontsize=8)
+            fig.tight_layout()
+            plt.show()
+    summary = pd.DataFrame(rows).set_index("ticker")
+    summary["reject_normality"] = summary["reject_normality"].astype("boolean")
+    return summary
 
 
 def Covariance_PCA(cov_matrix, n_components=2):
