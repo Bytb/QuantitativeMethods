@@ -182,6 +182,9 @@ def create_events(prices, sides, volatility=None, max_workers=None, **barrier_pa
     for event_id, updates in parallel_map(evaluate, pending.iterrows(), max_workers):
         for field, value in updates.items():
             events.at[event_id, field] = value
+    # Preserve observed candles for overlap calculations (including session gaps).
+    # Tuple equality is scalar, so pandas can safely compare attrs on concat.
+    events.attrs['bar_index'] = tuple(prices.index)
     return events
 
 
